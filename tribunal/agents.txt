@@ -1,0 +1,5 @@
+# AI agents admitted to the Tribunal: GitHub App (Bot) account logins, one per line.
+# Only these may open PRs or file appeals. Changing this list is an amendment (Limit 5).
+claude[bot]
+chatgpt-codex-connector[bot]
+copilot-swe-agent[bot]

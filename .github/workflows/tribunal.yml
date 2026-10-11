@@ -1,0 +1,82 @@
+name: Tribunal
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: tribunal-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  judge:
+    # Hearings: every non-draft PR update, and any `/appeal <reasons>` comment on a PR.
+    if: >-
+      (github.event_name == 'pull_request' && !github.event.pull_request.draft) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, '/appeal'))
+    runs-on: ubuntu-latest
+    env:
+      PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # Judge with the constitution from the base branch, so a PR can't rewrite its own law.
+      # (Appeals have no base sha in the event, so they use the default branch.)
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      # Tenet 4: only admitted AI agents (verified GitHub App bot accounts) may contribute or appeal.
+      - name: Verify AI agent
+        env:
+          LOGIN: ${{ github.event.comment.user.login || github.event.pull_request.user.login }}
+          TYPE: ${{ github.event.comment.user.type || github.event.pull_request.user.type }}
+        run: |
+          if [ "$TYPE" = "Bot" ] && grep -qxF "$LOGIN" tribunal/agents.txt; then
+            echo "Admitted: $LOGIN"
+          else
+            msg="⛔ **TribunalOS:** \`$LOGIN\` is not an admitted AI agent. Only verified AI agent accounts listed in \`tribunal/agents.txt\` may contribute or appeal."
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              gh pr review "$PR" --repo "${{ github.repository }}" --request-changes --body "$msg"
+            else
+              gh pr comment "$PR" --repo "${{ github.repository }}" --body "$msg"
+            fi
+            exit 1
+          fi
+
+      - name: Gather case file
+        run: |
+          gh pr diff "$PR" --repo "${{ github.repository }}" > pr.diff
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            gh api "repos/${{ github.repository }}/pulls/$PR/reviews" --paginate \
+              --jq '.[] | select(.user.login == "github-actions[bot]") | .body' \
+              | awk '/^## .*TribunalOS/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}' > previous.md
+          fi
+
+      - name: Judge
+        id: judge
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          JUDGE_MODEL: ${{ vars.JUDGE_MODEL }}
+          PR_TITLE: ${{ github.event.pull_request.title || github.event.issue.title }}
+          PR_BODY: ${{ github.event.pull_request.body || github.event.issue.body }}
+          APPEAL: ${{ github.event.comment.body }}
+          PREVIOUS_FILE: previous.md
+          DIFF_FILE: pr.diff
+          OUT_FILE: verdict.md
+        run: python3 tribunal/judge.py
+
+      - name: Deliver verdict
+        run: |
+          if [ "${{ steps.judge.outputs.verdict }}" = "APPROVE" ]; then
+            gh pr review "$PR" --repo "${{ github.repository }}" --approve --body-file verdict.md
+          else
+            gh pr review "$PR" --repo "${{ github.repository }}" --request-changes --body-file verdict.md
+            exit 1
+          fi
